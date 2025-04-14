@@ -1,3 +1,4 @@
+import json
 import time
 import traceback
 from queue import Queue
@@ -87,14 +88,14 @@ class ZeroMqQueue:
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range("send", color="blue", category="IPC"):
-            self.socket.send_pyobj(obj)
+            self.socket.send_string(json.dumps(obj))
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            await self.socket.send_pyobj(obj)
+            await self.socket.send_string(json.dumps(obj))
         except TypeError as e:
-            logger.error(f"Cannot pickle {obj}")
+            logger.error(f"Cannot serialize {obj} to JSON")
             raise e
         except Exception as e:
             logger.error(f"Error sending object: {e}")
@@ -106,12 +107,12 @@ class ZeroMqQueue:
     def get(self) -> Any:
         self.setup_lazily()
 
-        return self.socket.recv_pyobj()
+        return json.loads(self.socket.recv_string())
 
     async def get_async(self) -> Any:
         self.setup_lazily()
 
-        return await self.socket.recv_pyobj()
+        return json.loads(await self.socket.recv_string())
 
     def close(self):
         if self.socket:
