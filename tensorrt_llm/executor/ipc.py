@@ -85,18 +85,39 @@ class ZeroMqQueue:
         else:
             return False
 
+    def _serialize_obj(self, obj: Any) -> str:
+        """Helper method to safely serialize objects to JSON"""
+        if isinstance(obj, Exception):
+            error_dict = {
+                "__exception__": True,
+                "type": obj.__class__.__name__,
+                "message": str(obj),
+                "traceback": traceback.format_exc()
+            }
+            return json.dumps(error_dict)
+        if isinstance(obj, bytes):
+            return json.dumps(obj.decode())
+        return json.dumps(obj)
+
+    def _deserialize_obj(self, data: str) -> Any:
+        """Helper method to deserialize objects from JSON"""
+        obj = json.loads(data)
+        if isinstance(obj, dict) and obj.get("__exception__", False):
+            # Reconstruct exception
+            exc_type = type(obj["type"], (Exception,), {})
+            obj = exc_type(obj["message"])
+            obj.traceback = obj["traceback"]
+        return obj
+
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range("send", color="blue", category="IPC"):
-            self.socket.send_string(json.dumps(obj))
+            self.socket.send_string(self._serialize_obj(obj))
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            await self.socket.send_string(json.dumps(obj))
-        except TypeError as e:
-            logger.error(f"Cannot serialize {obj} to JSON")
-            raise e
+            await self.socket.send_string(self._serialize_obj(obj))
         except Exception as e:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
@@ -106,13 +127,11 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
-
-        return json.loads(self.socket.recv_string())
+        return self._deserialize_obj(self.socket.recv_string())
 
     async def get_async(self) -> Any:
         self.setup_lazily()
-
-        return json.loads(await self.socket.recv_string())
+        return self._deserialize_obj(await self.socket.recv_string())
 
     def close(self):
         if self.socket:
