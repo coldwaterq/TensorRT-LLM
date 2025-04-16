@@ -27,7 +27,7 @@ def get_cancelling_request():
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, nvtx_mark,
                             nvtx_range, print_colored, print_colored_debug)
 from ..sampling_params import SamplingParams
-from ..bindings.executor import Response
+from ..bindings.executor import Response, Result, FinishReason
 
 # Import postprocessors lazily to avoid circular imports
 def get_postprocessor(name: str):
@@ -205,23 +205,25 @@ class ZeroMqQueue:
                 "sequence_index": obj.sequence_index,
                 "spec_dec_fast_logits_info": obj.spec_dec_fast_logits_info
             },
-            "deserialize": lambda obj: Result(
-                additional_outputs=obj["additional_outputs"],
-                context_logits=obj["context_logits"], 
-                context_phase_params=obj["context_phase_params"],
-                cum_log_probs=obj["cum_log_probs"],
-                decoding_iter=obj["decoding_iter"],
-                encoder_output=obj["encoder_output"],
-                finish_reasons=[FinishReason(reason) for reason in obj["finish_reasons"]],
-                generation_logits=obj["generation_logits"],
-                is_final=obj["is_final"],
-                is_sequence_final=obj["is_sequence_final"], 
-                log_probs=obj["log_probs"],
-                output_token_ids=obj["output_token_ids"],
-                request_perf_metrics=obj["request_perf_metrics"],
-                sequence_index=obj["sequence_index"],
-                spec_dec_fast_logits_info=obj["spec_dec_fast_logits_info"]
-            )
+            "deserialize": lambda obj: (
+                result := Result(),
+                setattr(result, "additional_outputs", obj["additional_outputs"]),
+                setattr(result, "context_logits", obj["context_logits"]),
+                setattr(result, "context_phase_params", obj["context_phase_params"]), 
+                setattr(result, "cum_log_probs", obj["cum_log_probs"]),
+                setattr(result, "decoding_iter", obj["decoding_iter"]),
+                setattr(result, "encoder_output", obj["encoder_output"]),
+                setattr(result, "finish_reasons", [FinishReason(reason) for reason in obj["finish_reasons"]]),
+                setattr(result, "generation_logits", obj["generation_logits"]),
+                setattr(result, "is_final", obj["is_final"]),
+                setattr(result, "is_sequence_final", obj["is_sequence_final"]),
+                setattr(result, "log_probs", obj["log_probs"]),
+                setattr(result, "output_token_ids", obj["output_token_ids"]),
+                setattr(result, "request_perf_metrics", obj["request_perf_metrics"]),
+                setattr(result, "sequence_index", obj["sequence_index"]),
+                setattr(result, "spec_dec_fast_logits_info", obj["spec_dec_fast_logits_info"]),
+                result
+            )[-1]
         },
         "Response": {
             "check": lambda obj: obj.__class__.__name__ == "Response",
@@ -232,12 +234,14 @@ class ZeroMqQueue:
                 "error_msg": obj.error_msg if obj.has_error() else "",
                 "result": ZeroMqQueue.BASE_SERIALIZABLE_TYPES["Result"]["serialize"](obj.result)
             },
-            "deserialize": lambda obj: Response(
+            "deserialize": lambda obj: 
+                Response(
                 request_id=obj["request_id"],
                 error_msg=obj["error_msg"],
+                client_id=obj["client_id"]) if obj["error_msg"] else Response(
+                request_id=obj["request_id"],
                 client_id=obj["client_id"],
-                result=ZeroMqQueue.BASE_SERIALIZABLE_TYPES["Result"]["deserialize"](obj["result"])
-            )
+                result=ZeroMqQueue.BASE_SERIALIZABLE_TYPES["Result"]["deserialize"](obj["result"]))
         }
     }
 
