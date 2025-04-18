@@ -50,6 +50,7 @@ namespace tensorrt_llm::batch_manager
 namespace kv_cache_manager
 {
 class KVCacheManager;
+struct OffsetTableDimensions;
 } // namespace kv_cache_manager
 
 namespace rnn_state_manager
@@ -86,9 +87,17 @@ namespace utils
 class CudaGraphExecutorCache;
 } // namespace utils
 
+struct RewindInputs
+{
+    SizeType32 maxBlocksPerSeq;
+    bool isUseOneMoreBlock;
+    SizeType32 numKvHeads;
+};
+
 class TrtGptModelInflightBatching : public TrtGptModel
 {
     using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+    using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
     using KvCacheConfig = kv_cache_manager::KvCacheConfig;
@@ -246,7 +255,7 @@ private:
     void createRuntimeContexts();
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
-        std::optional<std::vector<std::string>> const& additionalOutputNames);
+        std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
     void createRnnStateManager();
@@ -330,7 +339,7 @@ private:
 
     [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
-    void reshapeKvTensors(SizeType32 maxBlocksPerSeq, kv_cache_manager::CacheType kvCacheType, SizeType32 numPools);
+    void reshapeKvTensors(OffsetTableDimensions const& dims);
 
     [[nodiscard]] bool hasSpeculativeDecodingFastLogits() const noexcept override
     {
@@ -416,7 +425,7 @@ private:
     // Config for debugging output
     std::optional<executor::DebugConfig> mDebugConfig;
     // List of additional outputs for each request
-    std::optional<std::vector<std::string>> mAdditionalOutputNames;
+    std::optional<std::vector<executor::AdditionalModelOutput>> mAdditionalModelOutputs;
 
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;
@@ -533,6 +542,7 @@ private:
     RequestVector mDraftRequestsWaitingToSendLogits;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
+    RewindInputs mRewindInputs;
 
     /******************** Algorithms ********************/
     // Algorithms are reentrant, they are assigned a state at

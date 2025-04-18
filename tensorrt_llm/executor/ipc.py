@@ -1,4 +1,7 @@
 import json
+import hashlib
+import hmac
+import os
 import time
 import traceback
 from queue import Queue
@@ -24,10 +27,12 @@ def get_cancelling_request():
     from .request import CancellingRequest
     return CancellingRequest
 
-from ..llmapi.utils import (ManagedThread, enable_llm_debug, nvtx_mark,
-                            nvtx_range, print_colored, print_colored_debug)
+
 from ..sampling_params import SamplingParams
 from ..bindings.executor import Response, Result, FinishReason
+from .._utils import nvtx_mark, nvtx_range_debug
+from ..llmapi.utils import (ManagedThread, enable_llm_debug, print_colored,
+                            print_colored_debug)
 
 # Import postprocessors lazily to avoid circular imports
 def get_postprocessor(name: str):
@@ -246,22 +251,25 @@ class ZeroMqQueue:
     }
 
     def __init__(self,
-                 address: Optional[str] = None,
+                 address: Optional[tuple[str, Optional[bytes]]] = None,
                  *,
                  socket_type: int = zmq.PAIR,
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 additional_serializable_types: Optional[Dict] = None):
+                 additional_serializable_types: Optional[Dict] = None,
+                 use_hmac_encryption: bool = True):
         '''
         Parameters:
-            address (Tuple[str, str], optional): The address (tcp-ip_port, authkey) for the IPC. Defaults to None.
+            address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
             is_server (bool): Whether the current process is the server or the client.
             additional_serializable_types (Dict, optional): Additional types to be added to the serializable types.
+            use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
         self.socket_type = socket_type
-        self.address = address or "tcp://127.0.0.1:*"
+        self.address_endpoint = address[
+            0] if address is not None else "tcp://127.0.0.1:*"
         self.is_server = is_server
         self.context = zmq.Context() if not is_async else zmq.asyncio.Context()
         self.poller = None
@@ -269,7 +277,6 @@ class ZeroMqQueue:
 
         self._setup_done = False
         self.name = name
-        self.socket_type = socket_type
 
         # Initialize SERIALIZABLE_TYPES with base types
         self.SERIALIZABLE_TYPES = self.BASE_SERIALIZABLE_TYPES.copy()
@@ -280,15 +287,38 @@ class ZeroMqQueue:
 
         self.socket = self.context.socket(socket_type)
 
+        self.hmac_key = address[1] if address is not None else None
+        self.use_hmac_encryption = use_hmac_encryption
+
+        # Check HMAC key condition
+        if self.use_hmac_encryption and self.is_server and self.hmac_key is not None:
+            raise ValueError(
+                "Server should not receive HMAC key when encryption is enabled")
+        elif self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
+            raise ValueError(
+                "Client must receive HMAC key when encryption is enabled")
+        elif not self.use_hmac_encryption and self.hmac_key is not None:
+            raise ValueError(
+                "Server and client should not receive HMAC key when encryption is disabled"
+            )
+
         if (socket_type == zmq.PAIR
                 and self.is_server) or socket_type == zmq.PULL:
             self.socket.bind(
-                self.address
+                self.address_endpoint
             )  # Binds to the address and occupy a port immediately
-            self.address = self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+            self.address_endpoint = self.socket.getsockopt(
+                zmq.LAST_ENDPOINT).decode()
             print_colored_debug(
-                f"Server [{name}] bound to {self.address} in {self.socket_type_str[socket_type]}\n",
+                f"Server [{name}] bound to {self.address_endpoint} in {self.socket_type_str[socket_type]}\n",
                 "green")
+
+            if self.use_hmac_encryption:
+                # Initialize HMAC key for pickle encryption
+                logger.info(f"Generating a new HMAC key for server {self.name}")
+                self.hmac_key = os.urandom(32)
+
+            self.address = (self.address_endpoint, self.hmac_key)
 
     def setup_lazily(self):
         if self._setup_done:
@@ -297,9 +327,9 @@ class ZeroMqQueue:
 
         if not self.is_server:
             print_colored_debug(
-                f"Client [{self.name}] connecting to {self.address} in {self.socket_type_str[self.socket_type]}\n",
+                f"Client [{self.name}] connecting to {self.address_endpoint} in {self.socket_type_str[self.socket_type]}\n",
                 "green")
-            self.socket.connect(self.address)
+            self.socket.connect(self.address_endpoint)
 
         self.poller = zmq.Poller()
         self.poller.register(self.socket, zmq.POLLIN)
@@ -353,13 +383,30 @@ class ZeroMqQueue:
 
     def put(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range("send", color="blue", category="IPC"):
-            self.socket.send_string(self._serialize_obj(obj))
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            if self.use_hmac_encryption:
+                # Send pickled data with HMAC appended
+                data = self._serialize_obj(obj)
+                signed_data = self._sign_data(data)
+                self.socket.send(signed_data)
+            else:
+                # Send data without HMAC
+                self.socket.send_string(self._serialize_obj(obj))
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            await self.socket.send_string(self._serialize_obj(obj))
+            if self.use_hmac_encryption:
+                # Send pickled data with HMAC appended
+                data = self._serialize_obj(obj)
+                signed_data = self._sign_data(data)
+                await self.socket.send(signed_data)
+            else:
+                # Send data without HMAC
+                await self.socket.send_string(self._serialize_obj(obj))
+        except TypeError as e:
+            logger.error(f"Cannot pickle {obj}")
+            raise e
         except Exception as e:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
@@ -369,11 +416,45 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
-        return self._deserialize_obj(self.socket.recv_string())
+
+        if self.use_hmac_encryption:
+            # Receive signed data with HMAC
+            signed_data = self.socket.recv()
+
+            # Split data and HMAC
+            data = signed_data[:-32]
+            actual_hmac = signed_data[-32:]
+
+            # Verify HMAC
+            if not self._verify_hmac(data, actual_hmac):
+                raise RuntimeError("HMAC verification failed")
+
+            obj = self._deserialize_obj(data)
+        else:
+            # Receive data without HMAC
+            obj = self._deserialize_obj(self.socket.recv_string())
+        return obj
 
     async def get_async(self) -> Any:
         self.setup_lazily()
-        return self._deserialize_obj(await self.socket.recv_string())
+
+        if self.use_hmac_encryption:
+            # Receive signed data with HMAC
+            signed_data = await self.socket.recv()
+
+            # Split data and HMAC
+            data = signed_data[:-32]
+            actual_hmac = signed_data[-32:]
+
+            # Verify HMAC
+            if not self._verify_hmac(data, actual_hmac):
+                raise RuntimeError("HMAC verification failed")
+
+            obj = self._deserialize_obj(data)  
+        else:
+            # Receive data without HMAC
+            obj = self._deserialize_obj(await self.socket.recv_string())
+        return obj
 
     def close(self):
         if self.socket:
@@ -382,6 +463,17 @@ class ZeroMqQueue:
         if self.context:
             self.context.term()
             self.context = None
+
+    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
+        """Verify the HMAC of received pickle data."""
+        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
+        return hmac.compare_digest(expected_hmac, actual_hmac)
+
+    def _sign_data(self, data_before_encoding: bytes) -> bytes:
+        """Generate HMAC for data."""
+        hmac_signature = hmac.new(self.hmac_key, data_before_encoding,
+                                  hashlib.sha256).digest()
+        return data_before_encoding + hmac_signature
 
     def __del__(self):
         self.close()
@@ -394,7 +486,7 @@ class FusedIpcQueue:
     ''' A Queue-like container for IPC with optional message batched. '''
 
     def __init__(self,
-                 address: Optional[str] = None,
+                 address: Optional[tuple[str, Optional[bytes]]] = None,
                  *,
                  is_server: bool,
                  fuse_message=False,
@@ -447,7 +539,7 @@ class FusedIpcQueue:
         return self.queue.get()
 
     @property
-    def address(self) -> str:
+    def address(self) -> tuple[str, Optional[bytes]]:
         return self.queue.address
 
     def __del__(self):
