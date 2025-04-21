@@ -7,13 +7,21 @@ import traceback
 from queue import Queue
 from typing import Any, Dict, Optional
 
+import datetime
+
 import zmq
 import zmq.asyncio
+
+from ..bindings.executor import KvCacheRetentionConfig
 
 from tensorrt_llm.logger import logger
 def get_postproc_params():
     from .postproc_worker import PostprocParams
     return PostprocParams
+
+def get_postproc_worker():
+    from .postproc_worker import PostprocWorker 
+    return PostprocWorker
 def get_postproc_args():
     from .postproc_worker import PostprocArgs
     return PostprocArgs
@@ -54,62 +62,62 @@ class ZeroMqQueue:
 
     # Base serializable types and their handlers
     BASE_SERIALIZABLE_TYPES = {
-        "bytes": {
-            "check": lambda obj: isinstance(obj, bytes),
-            "serialize": lambda obj: {"__serial_type__": "bytes", "data": obj.hex()},
-            "deserialize": lambda obj: bytes.fromhex(obj["data"])
+        "builtins.list": {
+            "serialize": lambda self, obj: {"__serial_type__": "builtins.list", "objs": [self._serialize_obj(o).decode('utf-8') for o in obj]},
+            "deserialize": lambda self, obj: [self._deserialize_obj(o) for o in obj["objs"]]
         },
-        "Exception": {
-            "check": lambda obj: isinstance(obj, Exception),
-            "serialize": lambda obj: {
-                "__serial_type__": "Exception",
+        "builtins.bytes": {
+            "serialize": lambda self, obj: {"__serial_type__": "builtins.bytes", "data": obj.hex()},
+            "deserialize": lambda self, obj: bytes.fromhex(obj["data"])
+        },
+        "builtins.Exception": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "builtins.Exception",
                 "type": obj.__class__.__name__,
                 "message": str(obj),
                 "traceback": traceback.format_exc()
             },
-            "deserialize": lambda obj: type(obj["type"], (Exception,), {})(obj["message"])
+            "deserialize": lambda self, obj: type(obj["type"], (Exception,), {})(obj["message"])
         },
-        "GenerationRequest": {
-            "check": lambda obj: obj.__class__.__name__ == "GenerationRequest",
-            "serialize": lambda obj: {
-                "__serial_type__": "GenerationRequest",
+        "tensorrt_llm.executor.request.GenerationRequest": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "tensorrt_llm.executor.request.GenerationRequest",
                 "prompt_token_ids": obj.prompt_token_ids,
                 "query_token_ids": obj.query_token_ids,
-                "sampling_params": ZeroMqQueue.BASE_SERIALIZABLE_TYPES["SamplingParams"]["serialize"](obj.sampling_params),
-                "postproc_params": ZeroMqQueue.BASE_SERIALIZABLE_TYPES["PostprocParams"]["serialize"](obj.postproc_params) if obj.postproc_params else None,
+                "sampling_params": self._serialize_obj(obj.sampling_params),
+                "postproc_params": self._serialize_obj(obj.postproc_params),
                 "lora_request": obj.lora_request,
                 "prompt_adapter_request": obj.prompt_adapter_request,
                 "streaming": obj.streaming,
                 "prompt_tuning_config": obj.prompt_tuning_config,
                 "mrope_config": obj.mrope_config,
-                "kv_cache_retention_config": obj.kv_cache_retention_config,
+                "kv_cache_retention_config": self._serialize_obj(obj.kv_cache_retention_config),
                 "id": obj.id,
                 "disaggregated_params": obj.disaggregated_params
             },
-            "deserialize": lambda obj: get_generation_request()(
+            "deserialize": lambda self, obj: get_generation_request()(
                 prompt_token_ids=obj["prompt_token_ids"],
                 query_token_ids=obj["query_token_ids"],
-                sampling_params=ZeroMqQueue.BASE_SERIALIZABLE_TYPES["SamplingParams"]["deserialize"](obj["sampling_params"]),
-                postproc_params=ZeroMqQueue.BASE_SERIALIZABLE_TYPES["PostprocParams"]["deserialize"](obj["postproc_params"]) if obj["postproc_params"] else None,
+                sampling_params=self._deserialize_obj(obj["sampling_params"]),
+                postproc_params=self._deserialize_obj(obj["postproc_params"]),
                 lora_request=obj["lora_request"],
                 prompt_adapter_request=obj["prompt_adapter_request"],
                 streaming=obj["streaming"],
                 prompt_tuning_config=obj["prompt_tuning_config"],
                 mrope_config=obj["mrope_config"],
-                kv_cache_retention_config=obj["kv_cache_retention_config"],
+                kv_cache_retention_config=self._deserialize_obj(obj["kv_cache_retention_config"]),
                 disaggregated_params=obj["disaggregated_params"]
             ).set_id(obj["id"])
         },
-        "CancellingRequest": {
-            "check": lambda obj: obj.__class__.__name__ == "CancellingRequest",
-            "serialize": lambda obj: {
-                "__serial_type__": "CancellingRequest"
+        "tensorrt_llm.executor.request.CancellingRequest": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "tensorrt_llm.executor.request.CancellingRequest",
+                "id": obj.id
             },
-            "deserialize": lambda obj: get_cancelling_request()()
+            "deserialize": lambda self, obj: get_cancelling_request()(id=obj["id"])
         },
-        "SamplingParams": {
-            "check": lambda obj: isinstance(obj, SamplingParams),
-            "serialize": lambda obj: {
+        "tensorrt_llm.sampling_params.SamplingParams": {
+            "serialize": lambda self, obj: {
                 "__serial_type__": "SamplingParams",
                 "end_id": obj.end_id,
                 "pad_id": obj.pad_id,
@@ -138,7 +146,7 @@ class ZeroMqQueue:
                 "return_context_logits": obj.return_context_logits,
                 "return_generation_logits": obj.return_generation_logits
             },
-            "deserialize": lambda obj: SamplingParams(
+            "deserialize": lambda self, obj: SamplingParams(
                 end_id=obj["end_id"],
                 pad_id=obj["pad_id"],
                 max_tokens=obj["max_tokens"],
@@ -167,32 +175,60 @@ class ZeroMqQueue:
                 return_generation_logits=obj["return_generation_logits"]
             )
         },
-        "PostprocParams": {
-            "check": lambda obj: obj.__class__.__name__ == "PostprocParams",
-            "serialize": lambda obj: {
+        "KvCacheRetentionConfig": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "KvCacheRetentionConfig",
+                "retention_configs": [{"token_start": c.token_start, "token_end": c.token_end, "priority": c.priority, "duration_ms": c.duration_ms.total_seconds() if c.duration_ms else None} for c in obj.token_range_retention_configs],
+                "decode_retention_priority": obj.decode_retention_priority,
+                "decode_duration_ms": obj.decode_duration_ms.total_seconds() if obj.decode_duration_ms else None
+            },
+            "deserialize": lambda self, obj: KvCacheRetentionConfig(
+                [KvCacheRetentionConfig.TokenRangeRetentionConfig(c["token_start"], c["token_end"], c["priority"], datetime.timedelta(seconds=c["duration_ms"])) for c in obj["retention_configs"]],
+                obj["decode_retention_priority"],
+                datetime.timedelta(seconds=obj["decode_duration_ms"]) if obj["decode_duration_ms"] is not None else None
+            )
+        },
+        "tensorrt_llm.executor.postproc_worker.PostprocParams": {
+            "serialize": lambda self, obj: {
                 "__serial_type__": "PostprocParams",
                 "post_processor": {
                     "__serial_type__": "PostProcessorFunction",
                     "name": obj.post_processor.__name__ if obj.post_processor else None
                 },
-                "postproc_args": {
-                    "first_iteration": obj.postproc_args.first_iteration,
-                    "num_prompt_tokens": obj.postproc_args.num_prompt_tokens,
-                    "tokenizer": obj.postproc_args.tokenizer
-                }
+                "postproc_args": self._serialize_obj(obj.postproc_args)
             },
-            "deserialize": lambda obj: get_postproc_params()(
-                post_processor=get_postprocessor(obj["post_processor"]["name"]) if obj["post_processor"]["name"] else None,
-                postproc_args=get_postproc_args()(
-                    first_iteration=obj["postproc_args"]["first_iteration"],
-                    num_prompt_tokens=obj["postproc_args"]["num_prompt_tokens"],
-                    tokenizer=obj["postproc_args"]["tokenizer"]
-                )
+            "deserialize": lambda self, obj: get_postproc_params()(
+                post_processor=get_postprocessor(obj["post_processor"]["name"]),
+                postproc_args=self._deserialize_obj(obj["postproc_args"])
+            )
+        },
+        "tensorrt_llm.serve.postprocess_handlers.CompletionPostprocArgs": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "CompletionPostprocArgs",
+                "first_iteration": obj.first_iteration,
+                "num_prompt_tokens": obj.num_prompt_tokens,
+                "tokenizer": self._serialize_obj(obj.tokenizer),
+                "echo": obj.echo,
+                "model": obj.model,
+                "num_choices": obj.num_choices,
+                "prompt_idx": obj.prompt_idx,
+                "prompt": obj.prompt,
+                "stream_options": obj.stream_options
+            },
+            "deserialize": lambda self, obj: get_postproc_args()(
+                first_iteration=obj["first_iteration"],
+                num_prompt_tokens=obj["num_prompt_tokens"],
+                tokenizer=self._deserialize_obj(obj["tokenizer"]),
+                echo=obj["echo"],
+                model=obj["model"],
+                num_choices=obj["num_choices"],
+                prompt_idx=obj["prompt_idx"],
+                prompt=obj["prompt"],
+                stream_options=obj["stream_options"]
             )
         },
         "Result": {
-            "check": lambda obj: obj.__class__.__name__ == "Result",
-            "serialize": lambda obj: {
+            "serialize": lambda self, obj: {
                 "__serial_type__": "Result",
                 "additional_outputs": obj.additional_outputs,
                 "context_logits": obj.context_logits,
@@ -210,7 +246,7 @@ class ZeroMqQueue:
                 "sequence_index": obj.sequence_index,
                 "spec_dec_fast_logits_info": obj.spec_dec_fast_logits_info
             },
-            "deserialize": lambda obj: (
+            "deserialize": lambda self, obj: (
                 result := Result(),
                 setattr(result, "additional_outputs", obj["additional_outputs"]),
                 setattr(result, "context_logits", obj["context_logits"]),
@@ -231,22 +267,36 @@ class ZeroMqQueue:
             )[-1]
         },
         "Response": {
-            "check": lambda obj: obj.__class__.__name__ == "Response",
-            "serialize": lambda obj: {
+            "serialize": lambda self, obj: {
                 "__serial_type__": "Response",
                 "request_id": obj.request_id,
                 "client_id": obj.client_id,
                 "error_msg": obj.error_msg if obj.has_error() else "",
-                "result": ZeroMqQueue.BASE_SERIALIZABLE_TYPES["Result"]["serialize"](obj.result)
+                "result": self._serialize_obj(obj.result)
             },
-            "deserialize": lambda obj: 
+            "deserialize": lambda self, obj: 
                 Response(
                 request_id=obj["request_id"],
                 error_msg=obj["error_msg"],
                 client_id=obj["client_id"]) if obj["error_msg"] else Response(
                 request_id=obj["request_id"],
                 client_id=obj["client_id"],
-                result=ZeroMqQueue.BASE_SERIALIZABLE_TYPES["Result"]["deserialize"](obj["result"]))
+                result=self._deserialize_obj(obj["result"]))
+        },
+        "tensorrt_llm.executor.postproc_worker.Input": {
+            "serialize": lambda self, obj: {
+                "__serial_type__": "tensorrt_llm.executor.postproc_worker.Input",
+                "rsp": self._serialize_obj(obj.rsp),
+                "sampling_params": self._serialize_obj(obj.sampling_params),
+                "postproc_params": self._serialize_obj(obj.postproc_params),
+                "streaming": obj.streaming
+            },
+            "deserialize": lambda self, obj: get_postproc_worker().Input(
+                rsp=self._deserialize_obj(obj["rsp"]),
+                sampling_params=self._deserialize_obj(obj["sampling_params"]),
+                postproc_params=self._deserialize_obj(obj["postproc_params"]),
+                streaming=obj["streaming"]
+            )
         }
     }
 
@@ -349,36 +399,32 @@ class ZeroMqQueue:
 
     def _serialize_obj(self, obj: Any) -> str:
         """Helper method to safely serialize objects to JSON using approved types"""
-        for type_handler in self.SERIALIZABLE_TYPES.values():
-            if type_handler["check"](obj):
-                serialized_obj = type_handler["serialize"](obj)
-                try:
-                    return json.dumps(serialized_obj)
-                except Exception as e:
-                    logger.error(f"Error serializing object: {e}")
-                    logger.error(f"Serialized object: {serialized_obj}")
-                    logger.error(traceback.format_exc())
-                    raise e
+        if obj.__class__.__module__ + "." + obj.__class__.__name__ in self.SERIALIZABLE_TYPES.keys():
+            type_handler = self.SERIALIZABLE_TYPES[obj.__class__.__module__ + "." + obj.__class__.__name__]
+            serialized_obj = type_handler["serialize"](self,obj)
+            try:
+                return json.dumps(serialized_obj).encode('utf-8')
+            except Exception as e:
+                logger.error(f"Error serializing object: {e}")
+                logger.error(f"Serialized object: {serialized_obj}")
+                logger.error(traceback.format_exc())
+                raise e
                 
         # If object is not in approved list, try basic JSON serialization
         try:
-            return json.dumps(obj)
+            return json.dumps(obj).encode('utf-8')
         except TypeError as e:
-            if isinstance(obj, list):
-                serialized_objs = {"__serial_type__": "ObjectList", "objs": []}
-                for o in obj:
-                    serialized_objs["objs"].append(self._serialize_obj(o))
-                return json.dumps(serialized_objs)
-            raise TypeError(f"Object {obj} is not in approved serializable types") from e
+            logger.error(f"Serialized object: {obj}")
+            raise TypeError(f"Object {obj.__class__.__module__}.{obj.__class__.__name__} is not in approved serializable types") from e
 
     def _deserialize_obj(self, data: str) -> Any:
         """Helper method to deserialize objects from JSON using approved types"""
+        if type(data) == bytes:
+            data = data.decode('utf-8')
         obj = json.loads(data)
         if isinstance(obj, dict):
             if "__serial_type__" in obj.keys():
-                if obj["__serial_type__"] == "ObjectList":
-                    return [self._deserialize_obj(o) for o in obj["objs"]]
-                return self.SERIALIZABLE_TYPES[obj["__serial_type__"]]["deserialize"](obj)
+                return self.SERIALIZABLE_TYPES[obj["__serial_type__"]]["deserialize"](self,obj)
         return obj
 
     def put(self, obj: Any):
@@ -391,7 +437,7 @@ class ZeroMqQueue:
                 self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                self.socket.send_string(self._serialize_obj(obj))
+                self.socket.send(self._serialize_obj(obj))
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
@@ -403,7 +449,7 @@ class ZeroMqQueue:
                 await self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                await self.socket.send_string(self._serialize_obj(obj))
+                await self.socket.send(self._serialize_obj(obj))
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -432,7 +478,7 @@ class ZeroMqQueue:
             obj = self._deserialize_obj(data)
         else:
             # Receive data without HMAC
-            obj = self._deserialize_obj(self.socket.recv_string())
+            obj = self._deserialize_obj(self.socket.recv())
         return obj
 
     async def get_async(self) -> Any:
@@ -453,7 +499,7 @@ class ZeroMqQueue:
             obj = self._deserialize_obj(data)  
         else:
             # Receive data without HMAC
-            obj = self._deserialize_obj(await self.socket.recv_string())
+            obj = self._deserialize_obj(await self.socket.recv())
         return obj
 
     def close(self):
