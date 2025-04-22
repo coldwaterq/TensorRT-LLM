@@ -14,13 +14,13 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
-from ..llmapi.utils import (ManagedThread, enable_llm_debug, print_colored,
-                            print_colored_debug)
+from ..llmapi.utils import ManagedThread, enable_llm_debug, print_colored, print_colored_debug
 
 _NoValue = object()
 
+
 class ZeroMqQueue:
-    ''' A Queue-like container for IPC using ZeroMQ. '''
+    """A Queue-like container for IPC using ZeroMQ."""
 
     socket_type_str = {
         zmq.PAIR: "PAIR",
@@ -30,38 +30,45 @@ class ZeroMqQueue:
 
     # Base serializable types and their handlers
     BASE_SERIALIZABLE_TYPES = {
-        "builtins": ["bytes","Exception","dict","list","tuple","set"],
+        "builtins": ["bytes", "Exception", "dict", "list", "tuple", "set"],
         "datetime": ["datetime", "timedelta"],
-        "tensorrt_llm.executor.request": ["CancellingRequest","GenerationRequest"],
-        "tensorrt_llm.sampling_params":["SamplingParams"],
-        "tensorrt_llm.executor.postproc_worker":["PostprocParams","PostprocWorker.Input","PostprocWorker.Output"],
-        "tensorrt_llm.serve.postprocess_handlers":["CompletionPostprocArgs","completion_response_post_processor"],
-        "tensorrt_llm.bindings.executor":["Response","Result","FinishReason","KvCacheRetentionConfig","KvCacheRetentionConfig.TokenRangeRetentionConfig"],
-        "tensorrt_llm.serve.openai_protocol":["CompletionResponse","CompletionResponseChoice","UsageInfo"],
-        "torch._utils":["_rebuild_tensor_v2"],
-        "torch.storage":["_load_from_bytes"],
+        "tensorrt_llm.executor.request": ["CancellingRequest", "GenerationRequest"],
+        "tensorrt_llm.sampling_params": ["SamplingParams"],
+        "tensorrt_llm.executor.postproc_worker": ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
+        "tensorrt_llm.serve.postprocess_handlers": ["CompletionPostprocArgs", "completion_response_post_processor"],
+        "tensorrt_llm.bindings.executor": [
+            "Response",
+            "Result",
+            "FinishReason",
+            "KvCacheRetentionConfig",
+            "KvCacheRetentionConfig.TokenRangeRetentionConfig",
+        ],
+        "tensorrt_llm.serve.openai_protocol": ["CompletionResponse", "CompletionResponseChoice", "UsageInfo"],
+        "torch._utils": ["_rebuild_tensor_v2"],
+        "torch.storage": ["_load_from_bytes"],
     }
 
-    def __init__(self,
-                 address: Optional[tuple[str, Optional[bytes]]] = None,
-                 *,
-                 socket_type: int = zmq.PAIR,
-                 is_server: bool,
-                 is_async: bool = False,
-                 name: Optional[str] = None,
-                 additional_serializable_types: Optional[Dict] = None,
-                 use_hmac_encryption: bool = True):
-        '''
+    def __init__(
+        self,
+        address: Optional[tuple[str, Optional[bytes]]] = None,
+        *,
+        socket_type: int = zmq.PAIR,
+        is_server: bool,
+        is_async: bool = False,
+        name: Optional[str] = None,
+        additional_serializable_types: Optional[Dict] = None,
+        use_hmac_encryption: bool = True,
+    ):
+        """
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
             is_server (bool): Whether the current process is the server or the client.
             additional_serializable_types (Dict, optional): Additional types to be added to the serializable types.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
-        '''
+        """
 
         self.socket_type = socket_type
-        self.address_endpoint = address[
-            0] if address is not None else "tcp://127.0.0.1:*"
+        self.address_endpoint = address[0] if address is not None else "tcp://127.0.0.1:*"
         self.is_server = is_server
         self.context = zmq.Context() if not is_async else zmq.asyncio.Context()
         self.poller = None
@@ -72,7 +79,7 @@ class ZeroMqQueue:
 
         # Initialize SERIALIZABLE_TYPES with base types
         self.SERIALIZABLE_TYPES = self.BASE_SERIALIZABLE_TYPES.copy()
-        
+
         # Add any additional serializable types
         if additional_serializable_types:
             self.SERIALIZABLE_TYPES.update(additional_serializable_types)
@@ -140,24 +147,25 @@ class ZeroMqQueue:
             return False
 
     def _getattr(self, obj: Any, attr: str) -> Any:
-        for subpath in attr.split('.'):
+        for subpath in attr.split("."):
             obj = getattr(obj, subpath)
         return obj
 
     def _serialize_obj(self, obj: Any, retJson: bool = True) -> str:
         """Safely serialize objects to JSON using approved types.
-        
+
         Args:
             obj: The object to serialize
             retJson: Whether to return a JSON string (True) or Python dict (False)
-            
+
         Returns:
             Serialized representation of the object as either JSON string or dict
-            
+
         Raises:
             PicklingError: If object cannot be serialized
             NotImplementedError: If reduction case not handled
         """
+
         def format_output(obj: Any):
             """Format output as JSON string or return as-is based on retJson flag."""
             return json.dumps(obj) if retJson else obj
@@ -165,12 +173,9 @@ class ZeroMqQueue:
         # Handle tuples specially since JSON doesn't support them
         if type(obj) is tuple:
             serialized_list = self._serialize_obj(list(obj), retJson=False)
-            return format_output({
-                "__serial_type__": "tuple",
-                "module_name": "builtins", 
-                "class_name": "tuple",
-                "args": serialized_list
-            })
+            return format_output(
+                {"__serial_type__": "tuple", "module_name": "builtins", "class_name": "tuple", "args": serialized_list}
+            )
 
         # Try direct JSON serialization first
         try:
@@ -181,19 +186,18 @@ class ZeroMqQueue:
 
         # Handle special cases
         if type(obj) is bytes:
-            return format_output({
-                "__serial_type__": "bytes",
-                "module_name": "builtins",
-                "class_name": "bytes", 
-                "args": [obj.hex()]
-            })
+            return format_output(
+                {"__serial_type__": "bytes", "module_name": "builtins", "class_name": "bytes", "args": [obj.hex()]}
+            )
 
         if callable(obj):
-            return format_output({
-                "__serial_type__": "function",
-                "module_name": getattr(obj, "__module__", None),
-                "class_name": getattr(obj, "__qualname__", None)
-            })
+            return format_output(
+                {
+                    "__serial_type__": "function",
+                    "module_name": getattr(obj, "__module__", None),
+                    "class_name": getattr(obj, "__qualname__", None),
+                }
+            )
 
         # Handle classes with custom metaclass
         if issubclass(type(obj), type):
@@ -214,51 +218,57 @@ class ZeroMqQueue:
         if rv[0].__qualname__ == "__newobj__":
             return self._handle_newobj_reduction(rv, format_output)
         elif rv[0].__qualname__ == "set":
-            return format_output({
-                "__serial_type__": "set",
-                "module_name": "builtins",
-                "class_name": "set",
-                "args": self._serialize_obj(rv[1][0], retJson=False)
-            })
+            return format_output(
+                {
+                    "__serial_type__": "set",
+                    "module_name": "builtins",
+                    "class_name": "set",
+                    "args": self._serialize_obj(rv[1][0], retJson=False),
+                }
+            )
         elif len(rv) == 2:
-            return format_output({
-                "__serial_type__": "func_call",
-                "module_name": getattr(rv[0], "__module__", None),
-                "class_name": getattr(rv[0], "__qualname__", None),
-                "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1]]
-            })
+            return format_output(
+                {
+                    "__serial_type__": "func_call",
+                    "module_name": getattr(rv[0], "__module__", None),
+                    "class_name": getattr(rv[0], "__qualname__", None),
+                    "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1]],
+                }
+            )
 
         raise NotImplementedError(f"Unhandled reduce case {rv}")
 
     def _handle_newobj_reduction(self, rv: tuple, format_output: callable):
         """Helper to handle __newobj__ reduction case."""
-        return format_output({
-            "__serial_type__": "newobj",
-            "module_name": getattr(rv[1][0], "__module__", None),
-            "class_name": getattr(rv[1][0], "__qualname__", None),
-            "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1][1:]],
-            "state": self._serialize_obj(rv[2], retJson=False) if rv[2] is not None else None,
-            "litems": [self._serialize_obj(arg, retJson=False) for arg in rv[3]] if rv[3] is not None else None,
-            "ditems": {k: self._serialize_obj(v, retJson=False) for k,v in rv[4]} if rv[4] is not None else None
-        })
+        return format_output(
+            {
+                "__serial_type__": "newobj",
+                "module_name": getattr(rv[1][0], "__module__", None),
+                "class_name": getattr(rv[1][0], "__qualname__", None),
+                "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1][1:]],
+                "state": self._serialize_obj(rv[2], retJson=False) if rv[2] is not None else None,
+                "litems": [self._serialize_obj(arg, retJson=False) for arg in rv[3]] if rv[3] is not None else None,
+                "ditems": {k: self._serialize_obj(v, retJson=False) for k, v in rv[4]} if rv[4] is not None else None,
+            }
+        )
 
     def _deserialize_obj(self, data: str, isJson: bool = True) -> Any:
         """Helper method to deserialize objects from JSON using approved types.
-        
+
         Args:
             data (str): The serialized data to deserialize
             isJson (bool): Whether the data is JSON encoded. Defaults to True.
-            
+
         Returns:
             Any: The deserialized object
-            
+
         Raises:
             NotImplementedError: If trying to deserialize an unapproved class
             Exception: If encountering an unhandled serialization type
         """
         if isJson:
             if isinstance(data, bytes):
-                data = data.decode('utf-8')
+                data = data.decode("utf-8")
             obj = json.loads(data)
         else:
             obj = data
@@ -270,12 +280,11 @@ class ZeroMqQueue:
             return obj
 
         # Validate class is approved for deserialization
-        if obj["class_name"] not in self.SERIALIZABLE_TYPES.get(obj['module_name'], []):
-            raise NotImplementedError(
-                f"unapproved class {obj['module_name']} | {obj['class_name']}")
+        if obj["class_name"] not in self.SERIALIZABLE_TYPES.get(obj["module_name"], []):
+            raise NotImplementedError(f"unapproved class {obj['module_name']} | {obj['class_name']}")
 
         serial_type = obj["__serial_type__"]
-        
+
         # Handle basic types
         if serial_type == "bytes":
             return bytes.fromhex(obj["args"][0])
@@ -337,29 +346,30 @@ class ZeroMqQueue:
         if slots:
             for k, v in slots.items():
                 setattr(obj, k, v)
+
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                data = self._serialize_obj(obj).encode('utf-8')
+                data = self._serialize_obj(obj).encode("utf-8")
                 signed_data = self._sign_data(data)
                 self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                self.socket.send(self._serialize_obj(obj).encode('utf-8'))
+                self.socket.send(self._serialize_obj(obj).encode("utf-8"))
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                data = self._serialize_obj(obj).encode('utf-8')
+                data = self._serialize_obj(obj).encode("utf-8")
                 signed_data = self._sign_data(data)
                 await self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                await self.socket.send(self._serialize_obj(obj).encode('utf-8'))
+                await self.socket.send(self._serialize_obj(obj).encode("utf-8"))
         except TypeError as e:
             raise e
         except Exception as e:
@@ -405,7 +415,7 @@ class ZeroMqQueue:
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
 
-            obj = self._deserialize_obj(data)  
+            obj = self._deserialize_obj(data)
         else:
             # Receive data without HMAC
             obj = self._deserialize_obj(await self.socket.recv())
