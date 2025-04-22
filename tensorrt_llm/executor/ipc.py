@@ -15,6 +15,8 @@ import zmq.asyncio
 
 from ..bindings.executor import KvCacheRetentionConfig
 
+_NoValue = object()
+
 from tensorrt_llm.logger import logger
 def get_postproc_params():
     from .postproc_worker import PostprocParams
@@ -45,85 +47,16 @@ class ZeroMqQueue:
 
     # Base serializable types and their handlers
     BASE_SERIALIZABLE_TYPES = {
-        "builtins.list": {
-            "serialize": lambda self, obj: {"__serial_type__": "builtins.list", "objs": [self._serialize_obj(o) for o in obj]},
-            "deserialize": lambda self, obj: [self._deserialize_obj(o) for o in obj["objs"]]
-        },
-        "builtins.bytes": {
-            "serialize": lambda self, obj: {"__serial_type__": "builtins.bytes", "data": obj.hex()},
-            "deserialize": lambda self, obj: bytes.fromhex(obj["data"])
-        },
-        "builtins.Exception": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj, exclude_keys=['add_note']),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj)
-        },
-        "tensorrt_llm.executor.request.GenerationRequest": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj,exclude_keys=['set_id']),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj)
-        },
-        "tensorrt_llm.executor.request.CancellingRequest": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj),
-            "deserialize": lambda self, obj: self._basic_deserialize_call(obj)
-        },
-        "tensorrt_llm.executor.postproc_worker.PostprocParams": {
-            "serialize": lambda self, obj: {
-                "__serial_type__": "tensorrt_llm.executor.postproc_worker.PostprocParams",
-                "post_processor": {
-                    "__serial_type__": "PostProcessorFunction",
-                    "name": obj.post_processor.__name__ if obj.post_processor else None
-                },
-                "postproc_args": self._serialize_obj(obj.postproc_args)
-            },
-            "deserialize": lambda self, obj: get_postproc_params()(
-                post_processor=get_postprocessor(obj["post_processor"]["name"]),
-                postproc_args=self._deserialize_obj(obj["postproc_args"])
-            )
-        },
-        "tensorrt_llm.bindings.executor.Response": {
-            "serialize": lambda self, obj: {
-                "__serial_type__": "tensorrt_llm.bindings.executor.Response",
-                "request_id": obj.request_id,
-                "client_id": obj.client_id,
-                "error_msg": obj.error_msg if obj.has_error() else "",
-                "result": self._serialize_obj(obj.result)
-            },
-            "deserialize": lambda self, obj: 
-                Response(
-                request_id=obj["request_id"],
-                error_msg=obj["error_msg"],
-                client_id=obj["client_id"]) if obj["error_msg"] else Response(
-                request_id=obj["request_id"],
-                client_id=obj["client_id"],
-                result=self._deserialize_obj(obj["result"]))
-        },
-        "tensorrt_llm.sampling_params.SamplingParams": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj, exclude_keys=['_greedy_decoding','_get_bad_words','_validate','_setup','_get_stop_words','_get_stop_reasons_and_words','_get_sampling_config','_get_output_config','_get_guided_decoding_params']),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj)
-        },
-        "tensorrt_llm.executor.utils.RequestError": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj)
-        },
-        "tensorrt_llm.serve.postprocess_handlers.CompletionPostprocArgs": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj,exclude_keys=['from_request']),
-            "deserialize": lambda self, obj: self._basic_deserialize_call(obj)
-        },
-        "tensorrt_llm.executor.postproc_worker.Input": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj, classDepth=2, class_name="tensorrt_llm.executor.postproc_worker.PostprocWorker.Input")
-        },
-        "tensorrt_llm.bindings.executor.Result": {
-            "serialize": lambda self, obj: self._basic_serialize_attr(obj),
-            "deserialize": lambda self, obj: self._basic_deserialize_attr(obj)
-        },
-        "tensorrt_llm.bindings.executor.FinishReason": {
-            "serialize": lambda self, obj: {
-                "__serial_type__": "tensorrt_llm.bindings.executor.FinishReason",
-                "value": obj.value
-            },
-            "deserialize": lambda self, obj: 
-                FinishReason(obj["value"])
-        }
+        "builtins": ["bytes","Exception","dict","list","tuple","set"],
+        "datetime": ["datetime", "timedelta"],
+        "tensorrt_llm.executor.request": ["CancellingRequest","GenerationRequest"],
+        "tensorrt_llm.sampling_params":["SamplingParams"],
+        "tensorrt_llm.executor.postproc_worker":["PostprocParams","PostprocWorker.Input","PostprocWorker.Output"],
+        "tensorrt_llm.serve.postprocess_handlers":["CompletionPostprocArgs","completion_response_post_processor"],
+        "tensorrt_llm.bindings.executor":["Response","Result","FinishReason","KvCacheRetentionConfig","KvCacheRetentionConfig.TokenRangeRetentionConfig"],
+        "tensorrt_llm.serve.openai_protocol":["CompletionResponse","CompletionResponseChoice","UsageInfo"],
+        "torch._utils":["_rebuild_tensor_v2"],
+        "torch.storage":["_load_from_bytes"],
     }
 
     def __init__(self,
@@ -223,94 +156,178 @@ class ZeroMqQueue:
         else:
             return False
 
-    def _basic_serialize_dict(self, obj: Any) -> str:
-        obj_dict = obj.__dict__
-        for key, value in obj_dict.items():
-            obj_dict[key] = self._serialize_obj(value)
+    def _getattr(self, obj: Any, attr: str) -> Any:
+        for subpath in attr.split('.'):
+            obj = getattr(obj, subpath)
+        return obj
+
+    def _serialize_obj(self, obj: Any, retJson: bool = True) -> str:
+        """Safely serialize objects to JSON using approved types.
         
-        obj_dict["__serial_type__"] = obj.__class__.__module__ + "." + obj.__class__.__name__
-        return obj_dict
+        Args:
+            obj: The object to serialize
+            retJson: Whether to return a JSON string (True) or Python dict (False)
+            
+        Returns:
+            Serialized representation of the object as either JSON string or dict
+            
+        Raises:
+            PicklingError: If object cannot be serialized
+            NotImplementedError: If reduction case not handled
+        """
+        def format_output(obj: Any):
+            """Format output as JSON string or return as-is based on retJson flag."""
+            return json.dumps(obj) if retJson else obj
 
-    def _basic_deserialize_call(self, obj_dict: Dict[str, str]) -> str:
-        # Get the class from the module path
-        module_path, class_name = obj_dict["__serial_type__"].rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        cls = getattr(module, class_name)
-        
-        del(obj_dict["__serial_type__"])
-        for key, value in obj_dict.items():
-            obj_dict[key] = self._deserialize_obj(value)
+        # Handle tuples specially since JSON doesn't support them
+        if type(obj) is tuple:
+            serialized_list = self._serialize_obj(list(obj), retJson=False)
+            return format_output({
+                "__serial_type__": "tuple",
+                "module_name": "builtins", 
+                "class_name": "tuple",
+                "args": serialized_list
+            })
 
-        instance = cls(**obj_dict)
-                
-        return instance
-
-    def _basic_serialize_attr(self, obj: Any, exclude_keys: list = None) -> str:
-        obj_dict = {}
-        # Get all public attributes using dir()
-        print(obj.__class__.__name__)
-        for attr in dir(obj):
-            # Skip private/special attributes and methods
-            if not attr.startswith('__'):
-                # Skip excluded keys
-                if exclude_keys and attr in exclude_keys:
-                    continue
-                value = getattr(obj, attr)
-                # Only serialize if not a method/function
-                obj_dict[attr] = self._serialize_obj(value)
-        
-        obj_dict["__serial_type__"] = obj.__class__.__module__ + "." + obj.__class__.__name__
-        return obj_dict
-
-    def _basic_deserialize_attr(self, obj_dict: Dict[str, str], classDepth: int = 1, class_name: str = None) -> Any:
-        # Get the class from the module path
-        if class_name is None:
-            class_name = obj_dict["__serial_type__"]
-        class_names = class_name.rsplit(".", classDepth)
-        module_path = class_names[0]
-        class_names = class_names[1:]
-
-        module = importlib.import_module(module_path)
-        cls = getattr(module, class_names[0])
-        for i in range(1,len(class_names)):
-            cls = getattr(cls, class_names[i])
-        # Create a new instance
-        instance = cls.__new__(cls)
-        
-        # Deserialize each field
-        for key, value in obj_dict.items():
-            if key != "__serial_type__":
-                setattr(instance, key, self._deserialize_obj(value))
-                
-        return instance
-
-    def _serialize_obj(self, obj: Any) -> str:
-        """Helper method to safely serialize objects to JSON using approved types"""
-        if obj.__class__.__module__ + "." + obj.__class__.__name__ in self.SERIALIZABLE_TYPES.keys():
-            type_handler = self.SERIALIZABLE_TYPES[obj.__class__.__module__ + "." + obj.__class__.__name__]
-            try:
-                serialized_obj = type_handler["serialize"](self,obj)
-                return json.dumps(serialized_obj)
-            except Exception as e:
-                logger.error(f"Error serializing object: {e}")
-                logger.error(f"Object: {obj}")
-                raise e
-                
-        # If object is not in approved list, try basic JSON serialization
+        # Try direct JSON serialization first
         try:
-            return json.dumps(obj)
-        except TypeError as e:
-            logger.error(f"Unserializable object: {obj}")
-            raise TypeError(f"Object {obj.__class__.__module__}.{obj.__class__.__name__} is not in approved serializable types") from e
+            json.dumps(obj)
+            return format_output(obj)
+        except TypeError:
+            pass
 
-    def _deserialize_obj(self, data: str) -> Any:
+        # Handle special cases
+        if type(obj) is bytes:
+            return format_output({
+                "__serial_type__": "bytes",
+                "module_name": "builtins",
+                "class_name": "bytes", 
+                "args": [obj.hex()]
+            })
+
+        if callable(obj):
+            return format_output({
+                "__serial_type__": "function",
+                "module_name": getattr(obj, "__module__", None),
+                "class_name": getattr(obj, "__qualname__", None)
+            })
+
+        # Handle classes with custom metaclass
+        if issubclass(type(obj), type):
+            return format_output(obj)
+
+        # Get reduction method
+        reduce = getattr(obj, "__reduce_ex__", _NoValue)
+        if reduce is not _NoValue:
+            rv = reduce(4)
+        else:
+            reduce = getattr(obj, "__reduce__", _NoValue)
+            if reduce is not _NoValue:
+                rv = reduce()
+            else:
+                raise PicklingError(f"Can't pickle {type(obj).__name__} object: {obj}")
+
+        # Handle different reduction cases
+        if rv[0].__qualname__ == "__newobj__":
+            return self._handle_newobj_reduction(rv, format_output)
+        elif rv[0].__qualname__ == "Exception":
+            return format_output({
+                "__serial_type__": "exception",
+                "module_name": "builtins",
+                "class_name": "Exception",
+                "args": [rv[1][0]]
+            })
+        elif rv[0].__qualname__ == "set":
+            return format_output({
+                "__serial_type__": "set",
+                "module_name": "builtins",
+                "class_name": "set",
+                "args": self._serialize_obj(rv[1][0], retJson=False)
+            })
+        elif len(rv) == 2:
+            return format_output({
+                "__serial_type__": "func_call",
+                "module_name": getattr(rv[0], "__module__", None),
+                "class_name": getattr(rv[0], "__qualname__", None),
+                "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1]]
+            })
+
+        raise NotImplementedError(f"Unhandled reduce case {rv}")
+
+    def _handle_newobj_reduction(self, rv: tuple, format_output: callable):
+        """Helper to handle __newobj__ reduction case."""
+        return format_output({
+            "__serial_type__": "newobj",
+            "module_name": getattr(rv[1][0], "__module__", None),
+            "class_name": getattr(rv[1][0], "__qualname__", None),
+            "args": [self._serialize_obj(arg, retJson=False) for arg in rv[1][1:]],
+            "state": self._serialize_obj(rv[2], retJson=False) if rv[2] is not None else None,
+            "litems": [self._serialize_obj(arg, retJson=False) for arg in rv[3]] if rv[3] is not None else None,
+            "ditems": {k: self._serialize_obj(v, retJson=False) for k,v in rv[4]} if rv[4] is not None else None
+        })
+
+    def _deserialize_obj(self, data: str, isJson: bool = True) -> Any:
         """Helper method to deserialize objects from JSON using approved types"""
-        if type(data) == bytes:
-            data = data.decode('utf-8')
-        obj = json.loads(data)
+        
+        if isJson:
+            if type(data) == bytes:
+                data = data.decode('utf-8')
+            obj = json.loads(data)
+        else:
+            obj = data
+        
         if isinstance(obj, dict):
-            if "__serial_type__" in obj.keys():
-                return self.SERIALIZABLE_TYPES[obj["__serial_type__"]]["deserialize"](self,obj)
+            if "__serial_type__" in obj:
+                if obj["class_name"] not in self.SERIALIZABLE_TYPES.get(obj['module_name'],[]):
+                    raise NotImplementedError(f"unapproved class {obj['module_name']} | {obj['class_name']}")
+                elif obj["__serial_type__"] == "bytes":
+                    obj = bytes.fromhex(obj["args"][0])
+                elif obj["__serial_type__"] == "tuple":
+                    obj = tuple(self._deserialize_obj(obj["args"], isJson=False))
+                elif obj["__serial_type__"] == "function":
+                    module = importlib.import_module(obj["module_name"])
+                    cls = self._getattr(module, obj["class_name"])
+                    obj = cls
+                elif obj["__serial_type__"] == "exception":
+                    obj = Exception(obj["args"][0])
+                elif obj["__serial_type__"] == "func_call":
+                    module = importlib.import_module(obj["module_name"])
+                    cls = self._getattr(module, obj["class_name"])
+                    obj = cls(*[self._deserialize_obj(arg, isJson=False) for arg in obj["args"]])
+                elif obj["__serial_type__"] == "newobj":
+                    # Handle newobj case from _serialize_obj
+                    module = importlib.import_module(obj["module_name"])
+                    cls = self._getattr(module, obj["class_name"])
+                    args = [self._deserialize_obj(arg, isJson=False) for arg in obj["args"]]
+                    init_obj =  cls.__new__(cls, *args)
+                    if obj["state"] is not None:
+                        state = self._deserialize_obj(obj["state"], isJson=False)
+                        if hasattr(init_obj, "__setstate__"):
+                            init_obj.__setstate__(state)
+                        else:
+                            slots = None
+                            if isinstance(state, tuple) and len(state) == 2:
+                                state, slots = state
+                            if state:
+                                for k, v in state.items():
+                                    init_obj.__dict__[k] = v
+                            if slots:
+                                for k, v in slots.items():
+                                    setattr(init_obj, k, v)
+                        
+                    if obj["litems"] is not None:
+                        for v in obj["litems"]:
+                            init_obj.append(self._deserialize_obj(v, isJson=False))
+                    if obj["ditems"] is not None:
+                        for k,v in obj["ditems"].items():
+                            init_obj[k] = self._deserialize_obj(v, isJson=False)
+                    obj = init_obj  
+                elif obj["__serial_type__"] == "set":
+                    obj = set(self._deserialize_obj(obj["args"], isJson=False))
+                else:
+                    # Handle other serialization types
+                    raise Exception(f"unhandled serialization type {obj['__serial_type__']}")
+        
         return obj
 
     def put(self, obj: Any):
@@ -337,7 +354,6 @@ class ZeroMqQueue:
                 # Send data without HMAC
                 await self.socket.send(self._serialize_obj(obj).encode('utf-8'))
         except TypeError as e:
-            logger.error(f"Cannot pickle {obj}")
             raise e
         except Exception as e:
             logger.error(f"Error sending object: {e}")
