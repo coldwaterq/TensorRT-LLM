@@ -8,33 +8,16 @@ import importlib
 from queue import Queue
 from typing import Any, Dict, Optional
 
-import datetime
-
 import zmq
 import zmq.asyncio
 
-from ..bindings.executor import KvCacheRetentionConfig
-
-_NoValue = object()
-
 from tensorrt_llm.logger import logger
-def get_postproc_params():
-    from .postproc_worker import PostprocParams
-    return PostprocParams
 
-from ..bindings.executor import Response, Result, FinishReason
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, print_colored,
                             print_colored_debug)
 
-# Import postprocessors lazily to avoid circular imports
-def get_postprocessor(name: str):
-    from tensorrt_llm.serve.postprocess_handlers import (completion_response_post_processor,
-                                                       completion_stream_post_processor)
-    return {
-        "completion_response_post_processor": completion_response_post_processor,
-        "completion_stream_post_processor": completion_stream_post_processor,
-    }[name]
+_NoValue = object()
 
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
@@ -225,18 +208,11 @@ class ZeroMqQueue:
             if reduce is not _NoValue:
                 rv = reduce()
             else:
-                raise PicklingError(f"Can't pickle {type(obj).__name__} object: {obj}")
+                raise PicklingError(f"Can't mimic pickle {type(obj).__name__} object: {obj}")
 
         # Handle different reduction cases
         if rv[0].__qualname__ == "__newobj__":
             return self._handle_newobj_reduction(rv, format_output)
-        elif rv[0].__qualname__ == "Exception":
-            return format_output({
-                "__serial_type__": "exception",
-                "module_name": "builtins",
-                "class_name": "Exception",
-                "args": [rv[1][0]]
-            })
         elif rv[0].__qualname__ == "set":
             return format_output({
                 "__serial_type__": "set",
@@ -307,8 +283,6 @@ class ZeroMqQueue:
             return tuple(self._deserialize_obj(obj["args"], isJson=False))
         elif serial_type == "set":
             return set(self._deserialize_obj(obj["args"], isJson=False))
-        elif serial_type == "exception":
-            return Exception(obj["args"][0])
 
         # Handle function/class types
         module = importlib.import_module(obj["module_name"])
