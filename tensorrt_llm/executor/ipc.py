@@ -267,69 +267,102 @@ class ZeroMqQueue:
         })
 
     def _deserialize_obj(self, data: str, isJson: bool = True) -> Any:
-        """Helper method to deserialize objects from JSON using approved types"""
+        """Helper method to deserialize objects from JSON using approved types.
         
+        Args:
+            data (str): The serialized data to deserialize
+            isJson (bool): Whether the data is JSON encoded. Defaults to True.
+            
+        Returns:
+            Any: The deserialized object
+            
+        Raises:
+            NotImplementedError: If trying to deserialize an unapproved class
+            Exception: If encountering an unhandled serialization type
+        """
         if isJson:
-            if type(data) == bytes:
+            if isinstance(data, bytes):
                 data = data.decode('utf-8')
             obj = json.loads(data)
         else:
             obj = data
-        
-        if isinstance(obj, dict):
-            if "__serial_type__" in obj:
-                if obj["class_name"] not in self.SERIALIZABLE_TYPES.get(obj['module_name'],[]):
-                    raise NotImplementedError(f"unapproved class {obj['module_name']} | {obj['class_name']}")
-                elif obj["__serial_type__"] == "bytes":
-                    obj = bytes.fromhex(obj["args"][0])
-                elif obj["__serial_type__"] == "tuple":
-                    obj = tuple(self._deserialize_obj(obj["args"], isJson=False))
-                elif obj["__serial_type__"] == "function":
-                    module = importlib.import_module(obj["module_name"])
-                    cls = self._getattr(module, obj["class_name"])
-                    obj = cls
-                elif obj["__serial_type__"] == "exception":
-                    obj = Exception(obj["args"][0])
-                elif obj["__serial_type__"] == "func_call":
-                    module = importlib.import_module(obj["module_name"])
-                    cls = self._getattr(module, obj["class_name"])
-                    obj = cls(*[self._deserialize_obj(arg, isJson=False) for arg in obj["args"]])
-                elif obj["__serial_type__"] == "newobj":
-                    # Handle newobj case from _serialize_obj
-                    module = importlib.import_module(obj["module_name"])
-                    cls = self._getattr(module, obj["class_name"])
-                    args = [self._deserialize_obj(arg, isJson=False) for arg in obj["args"]]
-                    init_obj =  cls.__new__(cls, *args)
-                    if obj["state"] is not None:
-                        state = self._deserialize_obj(obj["state"], isJson=False)
-                        if hasattr(init_obj, "__setstate__"):
-                            init_obj.__setstate__(state)
-                        else:
-                            slots = None
-                            if isinstance(state, tuple) and len(state) == 2:
-                                state, slots = state
-                            if state:
-                                for k, v in state.items():
-                                    init_obj.__dict__[k] = v
-                            if slots:
-                                for k, v in slots.items():
-                                    setattr(init_obj, k, v)
-                        
-                    if obj["litems"] is not None:
-                        for v in obj["litems"]:
-                            init_obj.append(self._deserialize_obj(v, isJson=False))
-                    if obj["ditems"] is not None:
-                        for k,v in obj["ditems"].items():
-                            init_obj[k] = self._deserialize_obj(v, isJson=False)
-                    obj = init_obj  
-                elif obj["__serial_type__"] == "set":
-                    obj = set(self._deserialize_obj(obj["args"], isJson=False))
-                else:
-                    # Handle other serialization types
-                    raise Exception(f"unhandled serialization type {obj['__serial_type__']}")
-        
-        return obj
 
+        if not isinstance(obj, dict):
+            return obj
+
+        if "__serial_type__" not in obj:
+            return obj
+
+        # Validate class is approved for deserialization
+        if obj["class_name"] not in self.SERIALIZABLE_TYPES.get(obj['module_name'], []):
+            raise NotImplementedError(
+                f"unapproved class {obj['module_name']} | {obj['class_name']}")
+
+        serial_type = obj["__serial_type__"]
+        
+        # Handle basic types
+        if serial_type == "bytes":
+            return bytes.fromhex(obj["args"][0])
+        elif serial_type == "tuple":
+            return tuple(self._deserialize_obj(obj["args"], isJson=False))
+        elif serial_type == "set":
+            return set(self._deserialize_obj(obj["args"], isJson=False))
+        elif serial_type == "exception":
+            return Exception(obj["args"][0])
+
+        # Handle function/class types
+        module = importlib.import_module(obj["module_name"])
+        cls = self._getattr(module, obj["class_name"])
+
+        if serial_type == "function":
+            return cls
+        elif serial_type == "func_call":
+            args = [self._deserialize_obj(arg, isJson=False) for arg in obj["args"]]
+            return cls(*args)
+        elif serial_type == "newobj":
+            return self._deserialize_newobj(cls, obj)
+        else:
+            raise Exception(f"unhandled serialization type {serial_type}")
+
+    def _deserialize_newobj(self, cls: type, obj: dict) -> Any:
+        """Helper method to deserialize objects using __new__ and state restoration."""
+        # Create new instance
+        args = [self._deserialize_obj(arg, isJson=False) for arg in obj["args"]]
+        instance = cls.__new__(cls, *args)
+
+        # Restore state if present
+        if obj["state"] is not None:
+            state = self._deserialize_obj(obj["state"], isJson=False)
+            self._restore_state(instance, state)
+
+        # Restore list items
+        if obj["litems"] is not None:
+            for item in obj["litems"]:
+                instance.append(self._deserialize_obj(item, isJson=False))
+
+        # Restore dict items
+        if obj["ditems"] is not None:
+            for k, v in obj["ditems"].items():
+                instance[k] = self._deserialize_obj(v, isJson=False)
+
+        return instance
+
+    def _restore_state(self, obj: Any, state: Any) -> None:
+        """Helper method to restore object state during deserialization."""
+        if hasattr(obj, "__setstate__"):
+            obj.__setstate__(state)
+            return
+
+        slots = None
+        if isinstance(state, tuple) and len(state) == 2:
+            state, slots = state
+
+        if state:
+            obj.__dict__.update(state)
+
+        if slots:
+            for k, v in slots.items():
+                setattr(obj, k, v)
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
