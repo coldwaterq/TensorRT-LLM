@@ -35,9 +35,11 @@ BASE_ZMQ_CLASSES = {
         "Logprob", "LogProbsResult", "ResponseWrapper"
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse"],
+    "tensorrt_llm.executor.worker": ["worker_main"],
     "tensorrt_llm.llmapi._perf_evaluator": ["perform_faked_oai_postprocess"],
     "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
+    "tensorrt_llm.llmapi.llm_utils": ["CachedModelLoader._node_build_task"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.postprocess_handlers": [
